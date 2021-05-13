@@ -44,39 +44,50 @@ class SDMGRHead(nn.Module):
     def init_weights(self, pretrained=False):
         normal_init(self.edge_embed, mean=0, std=0.01)
 
-    def forward(self, relations, texts, x=None):
+    def forward(self, relations, texts, index, auxiliary_matrix, x=None):
         node_nums, char_nums = [], []
-        for text in texts:
-            node_nums.append(text.size(0))
-            char_nums.append((text > 0).sum(-1))
+        texts = texts.squeeze(dim=1)
+        node_nums = [texts.data.size(1)] * texts.data.size(0)
+        # for text in texts:
+        #     node_nums.append(text.size(0))
+        #     char_nums.append((text > 0).sum(-1))
 
-        max_num = max([char_num.max() for char_num in char_nums])
-        all_nodes = torch.cat([
-            torch.cat(
-                [text,
-                 text.new_zeros(text.size(0), max_num - text.size(1))], -1)
-            for text in texts
-        ])
-        embed_nodes = self.node_embed(all_nodes.clamp(min=0).long())
-        rnn_nodes, _ = self.rnn(embed_nodes)
+        all_nums = torch.clamp(texts, 0, 1).sum(-1).flatten().long()
+        # max_num = max([char_num.max() for char_num in char_nums])
+        # all_nodes = torch.cat([
+        #     torch.cat(
+        #         [text,
+        #          text.new_zeros(text.size(0), max_num - text.size(1))], -1)
+        #     for text in texts
+        # ])
+        # embed_nodes = self.node_embed(all_nodes.clamp(min=0).long())
 
-        nodes = rnn_nodes.new_zeros(*rnn_nodes.shape[::2])
-        all_nums = torch.cat(char_nums)
-        valid = all_nums > 0
-        nodes[valid] = rnn_nodes[valid].gather(
-            1, (all_nums[valid] - 1).unsqueeze(-1).unsqueeze(-1).expand(
-                -1, -1, rnn_nodes.size(-1))).squeeze(1)
+        embed_nodes = self.node_embed(texts)
+        rnn_nodes = self.rnn(embed_nodes)
+
+        # nodes = rnn_nodes.new_zeros(*rnn_nodes.shape[::2])
+        # all_nums = torch.cat(char_nums)
+        # valid = all_nums > 0
+        # nodes[valid] = rnn_nodes[valid].gather(
+        #     1, (all_nums[valid] - 1).unsqueeze(-1).unsqueeze(-1).expand(
+        #         -1, -1, rnn_nodes.size(-1))).squeeze(1)
+
+        rnn_nodes = rnn_nodes.reshape(rnn_nodes.data.size(0), -1, rnn_nodes.data.size(-1))
+        nodes = torch.index_select(rnn_nodes, dim=1, index=index)
 
         if x is not None:
             nodes = self.fusion([x, nodes])
 
-        all_edges = torch.cat(
-            [rel.view(-1, rel.size(-1)) for rel in relations])
-        embed_edges = self.edge_embed(all_edges.float())
-        embed_edges = F.normalize(embed_edges)
+        # all_edges = torch.cat(
+        #     [rel.view(-1, rel.size(-1)) for rel in relations])
+        embed_edges = self.edge_embed(relations)
+        # embed_edges = F.normalize(embed_edges)
+
+        eps = 1e-12
+        embed_edges = embed_edges * ((F.relu(embed_edges.pow(2).sum(-1, keepdim=True).pow(0.5) - eps) + eps).pow(-1))
 
         for gnn_layer in self.gnn_layers:
-            nodes, cat_nodes = gnn_layer(nodes, embed_edges, node_nums)
+            nodes, cat_nodes = gnn_layer(nodes, embed_edges, auxiliary_matrix, node_nums)
 
         node_cls, edge_cls = self.node_cls(nodes), self.edge_cls(cat_nodes)
         return node_cls, edge_cls
@@ -91,31 +102,40 @@ class GNNLayer(nn.Module):
         self.out_fc = nn.Linear(node_dim, node_dim)
         self.relu = nn.ReLU()
 
-    def forward(self, nodes, edges, nums):
+    def forward(self, nodes, edges, auxiliary_matrix, nums):
         start, cat_nodes = 0, []
-        for num in nums:
-            sample_nodes = nodes[start:start + num]
-            cat_nodes.append(
-                torch.cat([
-                    sample_nodes.unsqueeze(1).expand(-1, num, -1),
-                    sample_nodes.unsqueeze(0).expand(num, -1, -1)
-                ], -1).view(num**2, -1))
-            start += num
-        cat_nodes = torch.cat([torch.cat(cat_nodes), edges], -1)
+        # for num in nums:
+        #     sample_nodes = nodes[start:start + num]
+        #     cat_nodes.append(
+        #         torch.cat([
+        #             sample_nodes.unsqueeze(1).expand(-1, num, -1),
+        #             sample_nodes.unsqueeze(0).expand(num, -1, -1)
+        #         ], -1).view(num**2, -1))
+        #     start += num
+
+        start_nodes = nodes.unsqueeze(2)
+        end_nodes = nodes.unsqueeze(1)
+        temp_ones = torch.ones(nodes.data.size(0), nodes.data.size(1), nodes.data.size(1), nodes.data.size(2))
+        start_nodes = start_nodes * temp_ones
+        end_nodes = end_nodes * temp_ones
+        cat_nodes = torch.cat([start_nodes, end_nodes, edges], dim=-1)
+
         cat_nodes = self.relu(self.in_fc(cat_nodes))
         coefs = self.coef_fc(cat_nodes)
 
         start, residuals = 0, []
-        for num in nums:
-            residual = F.softmax(
-                -torch.eye(num).to(coefs.device).unsqueeze(-1) * 1e9 +
-                coefs[start:start + num**2].view(num, num, -1), 1)
-            residuals.append(
-                (residual *
-                 cat_nodes[start:start + num**2].view(num, num, -1)).sum(1))
-            start += num**2
 
-        nodes += self.relu(self.out_fc(torch.cat(residuals)))
+        # for num in nums:
+        #     residual = F.softmax(
+        #         -torch.eye(num).to(coefs.device).unsqueeze(-1) * 1e9 +
+        #         coefs[start:start + num**2].view(num, num, -1), 1)
+        #     residuals.append(
+        #         (residual *
+        #          cat_nodes[start:start + num**2].view(num, num, -1)).sum(1))
+        #     start += num**2
+
+        residuals = (F.softmax(auxiliary_matrix + coefs, dim=2) * cat_nodes).permute((0, 1, 3, 2)).sum(3, keepdim=False)
+        nodes += self.relu(self.out_fc(residuals))
         return nodes, cat_nodes
 
 
